@@ -1,4 +1,5 @@
 import io
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -7,198 +8,322 @@ import matplotlib.pyplot as plt
 C0 = 299_792_458.0
 Z0 = 376.730313668
 
-st.set_page_config(page_title="Multilayer Absorber TMM Tool", layout="wide")
+st.set_page_config(page_title="Multilayer Anisotropic Absorber Calculator", layout="wide")
 
-st.title("Multilayer Absorber Absorptivity Tool")
-st.caption("Normal-incidence, metal-backed multilayer absorber calculator using transmission-line / TMM theory.")
+def parse_angles(text):
+    out = []
+    for x in re.split(r"[,，;；\s]+", text.strip()):
+        if x:
+            out.append(float(x))
+    return out or [0.0]
 
-with st.expander("使用说明", expanded=True):
-    st.markdown(
-        """
-        **第一版适用范围：**
-        - 多层均匀平板材料；
-        - 垂直入射；
-        - 最后一面为金属背板，因此透射率近似为 0；
-        - 每层材料用复介电常数和复磁导率描述。
+def cplx(real, loss):
+    return np.asarray(real, dtype=complex) - 1j * np.asarray(loss, dtype=complex)
 
-        **层顺序：**
-        表格第 1 行是最靠近空气入射侧的层，最后 1 行是最靠近金属背板的层。
+def sqrt_branch(z):
+    q = np.sqrt(z.astype(complex) if isinstance(z, np.ndarray) else complex(z))
+    if isinstance(q, np.ndarray):
+        q = np.where(np.imag(q) > 0, -q, q)
+        q = np.where((np.abs(np.imag(q)) < 1e-14) & (np.real(q) < 0), -q, q)
+    else:
+        if q.imag > 0:
+            q = -q
+        if abs(q.imag) < 1e-14 and q.real < 0:
+            q = -q
+    return q
 
-        **损耗参数约定：**
-        程序内部使用：
-        \[
-        \epsilon_r = \epsilon' - j\epsilon'', \quad \mu_r = \mu' - j\mu''
-        \]
-        所以表格里的 `eps_loss` 和 `mu_loss` 填正数即可。
-        """
-    )
+def paper_material(num, f_ghz):
+    f = np.maximum(np.asarray(f_ghz, dtype=float), 1e-12)
+    if int(num) == 8:      # Mg-Zn ferrite
+        er = np.full_like(f, 12.0)
+        ei = np.zeros_like(f)
+        mr = 60.0 / (f ** 0.008)
+        mi = 15.0 / (f ** 0.015)
+    elif int(num) == 10:   # Fe-Si-Al
+        er = np.full_like(f, 2.0)
+        ei = np.full_like(f, 0.1)
+        mr = 80.0 / (f ** 0.003)
+        mi = 5.0 / (f ** 0.005)
+    elif int(num) == 13:   # Polyaniline
+        er = 5.0 / (f ** 0.861)
+        ei = 8.0 / (f ** 0.569)
+        mr = np.ones_like(f)
+        mi = np.zeros_like(f)
+    else:
+        raise ValueError("Paper library currently supports material 8, 10 and 13 only.")
+    eps = cplx(er, ei)
+    mu = cplx(mr, mi)
+    return eps, eps, mu, mu
 
-st.sidebar.header("Frequency Settings")
-f_start = st.sidebar.number_input("Start frequency / GHz", min_value=0.001, value=2.0, step=0.5)
-f_stop = st.sidebar.number_input("Stop frequency / GHz", min_value=0.001, value=18.0, step=0.5)
-n_points = st.sidebar.number_input("Number of points", min_value=11, max_value=5001, value=401, step=10)
+def kz_zc(freq_ghz, angle_deg, pol, eps_xy, eps_z, mu_xy, mu_z):
+    f = np.asarray(freq_ghz, dtype=float)
+    k0 = 2 * np.pi * f * 1e9 / C0
+    s = np.sin(np.deg2rad(angle_deg))
+    pol = pol.upper()
+    if pol == "TE":
+        q2 = mu_xy * eps_xy - (mu_xy / mu_z) * s**2
+        q = sqrt_branch(q2)
+        zc = Z0 * mu_xy / q
+    else:
+        q2 = eps_xy * mu_xy - (eps_xy / eps_z) * s**2
+        q = sqrt_branch(q2)
+        zc = Z0 * q / eps_xy
+    return k0 * q, zc
 
-st.sidebar.header("Layer Settings")
-n_layers = st.sidebar.number_input("Number of layers", min_value=1, max_value=20, value=2, step=1)
+def z_air(angle_deg, pol):
+    c = np.cos(np.deg2rad(angle_deg))
+    if abs(c) < 1e-12:
+        raise ValueError("Angle is too close to 90 degrees.")
+    return Z0 / c if pol.upper() == "TE" else Z0 * c
 
-default_rows = []
-for i in range(int(n_layers)):
-    default_rows.append(
-        {
-            "layer": i + 1,
-            "thickness_mm": 1.0,
-            "eps_real": 4.0,
-            "eps_loss": 0.3,
-            "mu_real": 1.0,
-            "mu_loss": 0.0,
-        }
-    )
-
-st.subheader("Layer Parameters")
-st.write("Edit the table below. Row 1 is the air side; the last row is the metal-backed side.")
-
-df = st.data_editor(
-    pd.DataFrame(default_rows),
-    num_rows="fixed",
-    use_container_width=True,
-    hide_index=True,
-)
-
-uploaded = st.file_uploader(
-    "Optional: upload CSV layer table",
-    type=["csv"],
-    help="CSV columns: thickness_mm, eps_real, eps_loss, mu_real, mu_loss. The optional layer column is allowed.",
-)
-
-if uploaded is not None:
-    try:
-        csv_df = pd.read_csv(uploaded)
-        required = ["thickness_mm", "eps_real", "eps_loss", "mu_real", "mu_loss"]
-        missing = [c for c in required if c not in csv_df.columns]
-        if missing:
-            st.error(f"CSV missing required columns: {missing}")
-        else:
-            if "layer" not in csv_df.columns:
-                csv_df.insert(0, "layer", range(1, len(csv_df) + 1))
-            df = csv_df[["layer", "thickness_mm", "eps_real", "eps_loss", "mu_real", "mu_loss"]]
-            st.success("CSV loaded successfully.")
-            st.dataframe(df, use_container_width=True, hide_index=True)
-    except Exception as exc:
-        st.error(f"Failed to read CSV: {exc}")
-
-def metal_backed_absorption(freq_ghz: np.ndarray, layers: pd.DataFrame):
-    """
-    Calculates reflection and absorption of a metal-backed multilayer absorber
-    at normal incidence.
-
-    Uses transmission-line recursion:
-    Zin = Zi * (ZL + j Zi tan(ki d)) / (Zi + j ZL tan(ki d))
-    Metal backing is modeled as a short circuit: ZL = 0.
-    """
-    f_hz = np.asarray(freq_ghz, dtype=float) * 1e9
-    k0 = 2 * np.pi * f_hz / C0
-
-    # Metal backing: short-circuit load.
-    zin_load = np.zeros_like(f_hz, dtype=complex)
-
-    # Recursion from metal side to air side.
+def response(freq, layers, mode, angle, pol):
+    zin_load = np.zeros_like(freq, dtype=complex)
     for _, row in layers.iloc[::-1].iterrows():
         d = float(row["thickness_mm"]) * 1e-3
-        eps_r = complex(float(row["eps_real"]), -float(row["eps_loss"]))
-        mu_r = complex(float(row["mu_real"]), -float(row["mu_loss"]))
+        if mode == "内置示例：论文五层结构":
+            eps_xy, eps_z, mu_xy, mu_z = paper_material(row["material_number"], freq)
+        elif mode == "Custom isotropic":
+            eps = cplx(float(row["eps_real"]), float(row["eps_loss"]))
+            mu = cplx(float(row["mu_real"]), float(row["mu_loss"]))
+            eps_xy = np.full_like(freq, eps, dtype=complex)
+            eps_z = np.full_like(freq, eps, dtype=complex)
+            mu_xy = np.full_like(freq, mu, dtype=complex)
+            mu_z = np.full_like(freq, mu, dtype=complex)
+        else:
+            eps_xy_v = cplx(float(row["eps_xy_real"]), float(row["eps_xy_loss"]))
+            eps_z_v = cplx(float(row["eps_z_real"]), float(row["eps_z_loss"]))
+            mu_xy_v = cplx(float(row["mu_xy_real"]), float(row["mu_xy_loss"]))
+            mu_z_v = cplx(float(row["mu_z_real"]), float(row["mu_z_loss"]))
+            eps_xy = np.full_like(freq, eps_xy_v, dtype=complex)
+            eps_z = np.full_like(freq, eps_z_v, dtype=complex)
+            mu_xy = np.full_like(freq, mu_xy_v, dtype=complex)
+            mu_z = np.full_like(freq, mu_z_v, dtype=complex)
 
-        zi = Z0 * np.sqrt(mu_r / eps_r)
-        ki = k0 * np.sqrt(mu_r * eps_r)
-        tan_term = np.tan(ki * d)
-
-        numerator = zin_load + 1j * zi * tan_term
-        denominator = zi + 1j * zin_load * tan_term
-        zin = zi * numerator / denominator
+        kz, zc = kz_zc(freq, angle, pol, eps_xy, eps_z, mu_xy, mu_z)
+        t = np.tan(kz * d)
+        zin = zc * (zin_load + 1j * zc * t) / (zc + 1j * zin_load * t)
         zin_load = zin
 
-    gamma = (zin_load - Z0) / (zin_load + Z0)
-    reflectivity = np.abs(gamma) ** 2
-    absorptivity = 1 - reflectivity
+    gamma = (zin_load - z_air(angle, pol)) / (zin_load + z_air(angle, pol))
+    R = np.abs(gamma) ** 2
+    A = np.clip(1 - R, 0, 1)
+    RL = 10 * np.log10(np.maximum(R, 1e-15))
+    RL = np.where(np.abs(RL) < 1e-10, 0, RL)
+    return zin_load, gamma, R.real, A.real, RL.real
 
-    return zin_load, gamma, reflectivity.real, np.clip(absorptivity.real, 0, 1)
+def default_df(mode, n):
+    if mode == "内置示例：论文五层结构":
+        return pd.DataFrame([
+            {"layer": 1, "material_number": 13, "material_name": "Polyaniline", "thickness_mm": 1.996},
+            {"layer": 2, "material_number": 10, "material_name": "Fe-Si-Al", "thickness_mm": 0.288},
+            {"layer": 3, "material_number": 13, "material_name": "Polyaniline", "thickness_mm": 1.998},
+            {"layer": 4, "material_number": 10, "material_name": "Fe-Si-Al", "thickness_mm": 1.219},
+            {"layer": 5, "material_number": 8,  "material_name": "Mg-Zn ferrite", "thickness_mm": 1.999},
+        ])
+    if mode == "Custom isotropic":
+        return pd.DataFrame([{
+            "layer": i + 1, "thickness_mm": 1.0,
+            "eps_real": 4.0, "eps_loss": 0.3,
+            "mu_real": 1.0, "mu_loss": 0.0,
+        } for i in range(int(n))])
+    return pd.DataFrame([{
+        "layer": i + 1, "thickness_mm": 1.0,
+        "eps_xy_real": 4.0, "eps_xy_loss": 0.3,
+        "eps_z_real": 4.0, "eps_z_loss": 0.3,
+        "mu_xy_real": 1.0, "mu_xy_loss": 0.0,
+        "mu_z_real": 1.0, "mu_z_loss": 0.0,
+    } for i in range(int(n))])
 
-run = st.button("Calculate", type="primary")
+def required_cols(mode):
+    if mode == "内置示例：论文五层结构":
+        return ["material_number", "thickness_mm"]
+    if mode == "Custom isotropic":
+        return ["thickness_mm", "eps_real", "eps_loss", "mu_real", "mu_loss"]
+    return ["thickness_mm", "eps_xy_real", "eps_xy_loss", "eps_z_real", "eps_z_loss",
+            "mu_xy_real", "mu_xy_loss", "mu_z_real", "mu_z_loss"]
 
-if run:
+st.title("Multilayer Anisotropic Absorber Calculator")
+st.caption("Metal-backed multilayer absorber calculator: oblique incidence, TE/TM, and uniaxial anisotropy.")
+
+with st.expander("模型说明", expanded=True):
+    st.markdown(
+        """
+### 1. 层顺序
+
+表格中的第 1 行表示最靠近空气入射侧的材料层，最后 1 行表示最靠近金属背板的材料层。
+
+### 2. 损耗参数约定
+
+本程序内部采用如下复数形式：
+
+ε = ε' - jε''
+
+μ = μ' - jμ''
+
+因此，在表格中填写损耗项时，损耗参数填正数即可。
+
+### 3. 单轴各向异性材料
+
+本程序目前考虑单轴各向异性材料，即：
+
+εx = εy = εxy
+
+εz 单独设置
+
+μx = μy = μxy
+
+μz 单独设置
+
+其中：
+
+- eps_xy_real、eps_xy_loss 表示 x/y 方向介电常数的实部和损耗；
+- eps_z_real、eps_z_loss 表示 z 方向介电常数的实部和损耗；
+- mu_xy_real、mu_xy_loss 表示 x/y 方向磁导率的实部和损耗；
+- mu_z_real、mu_z_loss 表示 z 方向磁导率的实部和损耗。
+
+### 4. 垂直入射和斜入射的区别
+
+在垂直入射时，电磁波主要受到横向参数 εxy 和 μxy 的影响。
+
+当考虑斜入射时，尤其是 TM 极化情况下，z 方向参数 εz 和 μz 的影响会更加明显。
+"""
+    )
+
+
+st.sidebar.header("Frequency")
+f1 = st.sidebar.number_input("Start frequency / GHz", min_value=0.001, value=0.1, step=0.1, format="%.3f")
+f2 = st.sidebar.number_input("Stop frequency / GHz", min_value=0.001, value=10.0, step=0.5, format="%.3f")
+nf = st.sidebar.number_input("Number of points", min_value=11, max_value=10001, value=501, step=10)
+
+st.sidebar.header("Incidence")
+angle_text = st.sidebar.text_input("Incident angles / degree", "0, 30, 60")
+pol_choice = st.sidebar.selectbox("Polarization", ["TE", "TM", "Both"], index=0)
+
+st.sidebar.header("Material")
+mode = st.sidebar.selectbox("Input mode", ["Custom isotropic", "Custom uniaxial anisotropic", "Paper 2025 optimized stack"], index=1)
+n_layers = 5 if mode == "Paper 2025 optimized stack" else st.sidebar.number_input("Number of layers", 1, 30, 2, 1)
+
+st.subheader("Layer Parameters")
+if mode == "Paper 2025 optimized stack":
+    st.info("This uses the paper stack: 13 / 10 / 13 / 10 / 8, with thicknesses 1.996, 0.288, 1.998, 1.219, 1.999 mm. Material parameters are frequency-dependent.")
+else:
+    st.write("Edit the table below. Row 1 is the air side; the last row is the metal-backed side.")
+
+df0 = default_df(mode, n_layers)
+
+up = st.file_uploader("Optional: upload CSV layer table", type=["csv"])
+if up is not None:
     try:
-        required_cols = ["thickness_mm", "eps_real", "eps_loss", "mu_real", "mu_loss"]
-        for col in required_cols:
-            if col not in df.columns:
-                raise ValueError(f"Missing column: {col}")
-            if df[col].isna().any():
-                raise ValueError(f"Column has empty values: {col}")
+        df = pd.read_csv(up)
+        if "layer" not in df.columns:
+            df.insert(0, "layer", range(1, len(df) + 1))
+        st.success("CSV loaded.")
+    except Exception as e:
+        st.error(f"CSV read failed: {e}")
+        df = df0
+else:
+    df = df0
 
-        freq = np.linspace(float(f_start), float(f_stop), int(n_points))
-        zin, gamma, R, A = metal_backed_absorption(freq, df)
+df = st.data_editor(df, use_container_width=True, hide_index=True, num_rows="fixed" if mode == "Paper 2025 optimized stack" else "dynamic")
 
-        result = pd.DataFrame(
-            {
-                "frequency_GHz": freq,
-                "reflectivity_R": R,
-                "absorptivity_A": A,
-                "return_loss_dB": np.where(
-                    np.abs(-10 * np.log10(np.maximum(R, 1e-15))) < 1e-10,
-                    0,
-                    -10 * np.log10(np.maximum(R, 1e-15))
-                ),
-                "reflection_coefficient_abs": np.abs(gamma),
-                "input_impedance_real_ohm": zin.real,
-                "input_impedance_imag_ohm": zin.imag,
-            }
-        )
+st.download_button(
+    "Download CSV template",
+    data=default_df(mode, n_layers).to_csv(index=False).encode("utf-8-sig"),
+    file_name="layer_template_v2.csv",
+    mime="text/csv",
+)
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Max absorptivity", f"{A.max():.4f}")
-        c2.metric("Frequency at max A", f"{freq[A.argmax()]:.4f} GHz")
-        c3.metric("Min reflectivity", f"{R.min():.4e}")
+if st.button("Calculate", type="primary"):
+    try:
+        if f2 <= f1:
+            raise ValueError("Stop frequency must be greater than start frequency.")
+        for c in required_cols(mode):
+            if c not in df.columns:
+                raise ValueError(f"Missing column: {c}")
+            if df[c].isna().any():
+                raise ValueError(f"Column has empty values: {c}")
 
-        fig, ax = plt.subplots()
-        ax.plot(freq, A, label="Absorptivity A")
-        ax.plot(freq, R, label="Reflectivity R")
-        ax.set_xlabel("Frequency (GHz)")
-        ax.set_ylabel("Value")
-        ax.set_title("Metal-backed Multilayer Absorber Response")
-        ax.set_ylim(0, 1.05)
-        ax.grid(True)
-        ax.legend()
-        st.pyplot(fig)
+        freq = np.linspace(float(f1), float(f2), int(nf))
+        angles = parse_angles(angle_text)
+        for a in angles:
+            if a < 0 or a >= 89.9:
+                raise ValueError("Angles must be in [0, 89.9) degrees.")
+        pols = ["TE", "TM"] if pol_choice == "Both" else [pol_choice]
 
-        fig2, ax2 = plt.subplots()
-        ax2.plot(freq, result["return_loss_dB"])
-        ax2.set_xlabel("Frequency (GHz)")
-        ax2.set_ylabel("Return Loss (dB)")
-        ax2.set_title("Return Loss")
-        ax2.grid(True)
-        st.pyplot(fig2)
+        all_rows = []
+        summary = []
+        figA, axA = plt.subplots()
+        figRL, axRL = plt.subplots()
 
-        st.subheader("Result Table")
-        st.dataframe(result, use_container_width=True)
+        for pol in pols:
+            for angle in angles:
+                zin, gamma, R, A, RL = response(freq, df, mode, angle, pol)
+                label = f"{pol}, {angle:g} deg"
+                axA.plot(freq, A, label=label)
+                axRL.plot(freq, RL, label=label)
 
-        csv_buffer = io.StringIO()
-        result.to_csv(csv_buffer, index=False)
-        st.download_button(
-            "Download result CSV",
-            data=csv_buffer.getvalue(),
-            file_name="absorber_result.csv",
-            mime="text/csv",
-        )
+                idxA = int(np.argmax(A))
+                idxR = int(np.argmin(R))
+                summary.append({
+                    "polarization": pol,
+                    "angle_deg": angle,
+                    "max_absorptivity_A": A[idxA],
+                    "freq_at_max_A_GHz": freq[idxA],
+                    "min_reflectivity_R": R[idxR],
+                    "freq_at_min_R_GHz": freq[idxR],
+                    "max_return_loss_dB": RL[idxR],
+                })
 
-    except Exception as exc:
-        st.error(f"Calculation failed: {exc}")
+                for i in range(len(freq)):
+                    all_rows.append({
+                        "frequency_GHz": freq[i],
+                        "polarization": pol,
+                        "angle_deg": angle,
+                        "absorptivity_A": A[i],
+                        "reflectivity_R": R[i],
+                        "return_loss_dB": RL[i],
+                        "abs_gamma": abs(gamma[i]),
+                        "zin_real_ohm": zin[i].real,
+                        "zin_imag_ohm": zin[i].imag,
+                    })
+
+        axA.set_xlabel("Frequency (GHz)")
+        axA.set_ylabel("Absorptivity")
+        axA.set_title("Absorptivity of Metal-backed Multilayer Absorber")
+        axA.set_ylim(0, 1.05)
+        axA.grid(True)
+        axA.legend()
+
+        axRL.set_xlabel("Frequency (GHz)")
+        axRL.set_ylabel("S11 Magnitude (dB)")
+        axRL.set_title("S11 Magnitude")
+        axRL.grid(True)
+        axRL.legend()
+
+        summary_df = pd.DataFrame(summary)
+        result_df = pd.DataFrame(all_rows)
+
+        st.subheader("Summary")
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+        st.subheader("Absorptivity")
+        st.pyplot(figA)
+
+        st.subheader("Return Loss")
+        st.pyplot(figRL)
+
+        st.subheader("Full result table")
+        st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+        st.download_button("Download full result CSV", result_df.to_csv(index=False).encode("utf-8-sig"), "absorber_result_v2.csv", "text/csv")
+        st.download_button("Download summary CSV", summary_df.to_csv(index=False).encode("utf-8-sig"), "absorber_summary_v2.csv", "text/csv")
+
+    except Exception as e:
+        st.error(f"Calculation failed: {e}")
 
 st.divider()
-st.markdown(
-    """
-    **下一版可扩展功能：**
-    - 斜入射；
-    - TE / TM 极化；
-    - 无金属背板时同时计算 R、T、A；
-    - 频率相关材料参数；
-    - 自动优化层厚度或材料参数。
-    """
-)
+st.markdown("""
+**CST comparison:** for a metal-backed one-port model, compare with `1 - abs(S11)^2`.
+If transmission exists, use `1 - abs(S11)^2 - abs(S21)^2`.
+Make sure frequency range, layer order, thickness, material tensor direction, incident angle and polarization are identical.
+""")
