@@ -80,7 +80,7 @@ def response(freq, layers, mode, angle, pol):
     zin_load = np.zeros_like(freq, dtype=complex)
     for _, row in layers.iloc[::-1].iterrows():
         d = float(row["thickness_mm"]) * 1e-3
-        if mode == "内置示例：论文五层结构":
+        if mode == "Paper 2025 optimized stack":
             eps_xy, eps_z, mu_xy, mu_z = paper_material(row["material_number"], freq)
         elif mode == "Custom isotropic":
             eps = cplx(float(row["eps_real"]), float(row["eps_loss"]))
@@ -112,7 +112,7 @@ def response(freq, layers, mode, angle, pol):
     return zin_load, gamma, R.real, A.real, RL.real
 
 def default_df(mode, n):
-    if mode == "内置示例：论文五层结构":
+    if mode == "Paper 2025 optimized stack":
         return pd.DataFrame([
             {"layer": 1, "material_number": 13, "material_name": "Polyaniline", "thickness_mm": 1.996},
             {"layer": 2, "material_number": 10, "material_name": "Fe-Si-Al", "thickness_mm": 0.288},
@@ -135,7 +135,7 @@ def default_df(mode, n):
     } for i in range(int(n))])
 
 def required_cols(mode):
-    if mode == "内置示例：论文五层结构":
+    if mode == "Paper 2025 optimized stack":
         return ["material_number", "thickness_mm"]
     if mode == "Custom isotropic":
         return ["thickness_mm", "eps_real", "eps_loss", "mu_real", "mu_loss"]
